@@ -12,6 +12,7 @@ import threading
 import time
 import json
 import logging
+from time import sleep
 
 logger = logging.getLogger(__name__)
 
@@ -31,8 +32,8 @@ softwareversion = '0.01'
 # The DataUpdateSender class receives all the dbus-dataupdate-events, and forwards them to mqtt
 # if and when necessary.
 class DbusMqtt:
-	def __init__(self):
-		d = DbusMonitor(datalist.vrmtree, self._value_changed_on_dbus)
+	def __init__(self,mqqthost,nodeid,service,base_topic='emonhub'):
+		self.d = DbusMonitor(datalist.vrmtree, self._value_changed_on_dbus)
 
 		"""
 		self.ttl = 300    # seconds to keep sending the updates.  If no keepAlive received in this
@@ -41,7 +42,7 @@ class DbusMqtt:
 		self.lastKeepAliveRcd = int(time.time()) - self.ttl   # initialised to when this code launches
 		"""
 
-		self.ttm = 2      # seconds to gather data before sending, 0 - send immediate, NN - gather
+		self.ttm = 0      # seconds to gather data before sending, 0 - send immediate, NN - gather
 						  # for NN seconds
 		self._last_publish = int(time.time() - 60)  # Just an initialisation value, so the first
 											   # ttm timeout is _now_
@@ -52,8 +53,35 @@ class DbusMqtt:
 		self._mqtt.loop_start()  # creates new thread and runs Mqtt.loop_forever() in it.
 		self._mqtt.on_connect = self._on_connect
 		self._mqtt.on_message = self._on_message
-		self._mqtt.connect_async('test.mosquitto.org', port=1883, keepalive=60, bind_address="")
-		logger.debug('our client id (and also topic) is %s' % get_vrm_portal_id())
+		self._mqtt.connect_async(mqqthost, port=1883, keepalive=60, bind_address="")
+
+
+		self._service_name = service
+
+		self._nodeid = nodeid #node ide expected by emonhub . need to modigy emonhub.conf accordingly
+		self._topic = base_topic
+		message = '{basetopic}/tx/{nodeid}/values'
+		self._publishPath = message.format(basetopic=self._topic,nodeid=self._nodeid)
+
+
+
+
+	def get_service_values(self):
+	 	 """
+		 Hackish way to send BMV data on dbus to MQTT for EMON
+	 	 """
+  		 current_vals = self.d.get_values_for_service(['onIntervalAlways'],self._service_name)
+		 payload = []
+		 #Create String that Emon will like
+		 for val in current_vals:
+			payload.append(str(current_vals[val]))
+
+		 #Emon Expects , between data point objects
+		 payload_str = ", ".join(payload)
+		 logger.debug('Sending payload data  %s  ' % (payload_str))
+		 #publish away
+		 self._publish(payload_str,self._topic)
+
 
 	#   servicename: for example com.victronenergy.dbus.ttyO1
 	#   path: for example /Ac/ActiveIn/L1/V
@@ -68,8 +96,10 @@ class DbusMqtt:
 			'code': props["code"], 'instance': instance, 'value': str(changes['Value'])}
 
 		if self.ttm:     # != 0, ie. gather before sending
+
+			logger.debug('Got data from DBUS checking ttm')
 			if self._marshall_says_go():
-				self._publish()
+				self._publish(str(self._gathered_data),self._topic)
 			elif self._gathered_data_timer is None:
 				# Set timer, to make sure that this data will not reside in this queue for longer
 				# than ttm-time
@@ -78,7 +108,9 @@ class DbusMqtt:
 					exit_on_error, self._publish)
 
 		else:       # send immediate
-			self._publish()
+			logger.debug('collected data : %s'%self._gathered_data)
+			logger.debug('sending data')
+			self._publish(str(self._gathered_data),self._topic)
 
 	def _on_message(self, client, userdata, msg):
 		logger.debug('message! userdata: %s, message %s' % (userdata, msg.topic+" "+str(msg.payload)))
@@ -106,7 +138,7 @@ class DbusMqtt:
 	def _marshall_says_go(self):
 		return (self._last_publish + self.ttm) < int(time.time())
 
-	def _publish(self):
+	def _publish(self,payload,topic):
 		self._last_publish = int(time.time())
 
 		"""
@@ -123,28 +155,47 @@ class DbusMqtt:
 		send_to_pubnub('livefeed', message)
 		return False    # let gobject know that it is not necessary to fire us again.
 		"""
-		topic = '/' + get_vrm_portal_id()
-		payload = 'hello world!'
+		topic = self._publishPath
 		logger.debug('publishing on topic "%s", data "%s"' % (topic, payload))
-
 		self._mqtt.publish(topic, payload=payload, qos=0, retain=False)
 
 def main():
 	# Argument parsing
 	parser = argparse.ArgumentParser(
-		description='vrmpubnub v%s: two-way comms between user and the D-Bus on the CCGX.' % softwareversion
+		description=' Get data from Victron device in DBUS and relay to MQTT for EMON to pickup V %s' % softwareversion
 	)
 
 	parser.add_argument("-d", "--debug", help="set logging level to debug",
 						action="store_true")
 
-	# parser.add_argument("-n", "--nosecurity", help="no AES encryption and no random channelnames",
-	#					action="store_true")
+	parser.add_argument("nodeid", help="nodeid defined in emonhub.conf",
+						type=int)
 
+	parser.add_argument("mqtt", help="ip address for mqtt server",
+						)
+
+	parser.add_argument("-t", "--topic", help="base topic for emonhub, default is emonhub",
+						default="emonhub")
+
+	parser.add_argument("service", help="serivce name to look for on dbus sample  example: com.victronenergy.battery.ttyUSB0",
+						action="store")
+
+	parser.add_argument("-c", "--ctime", help="cycle time for service , numeric value to specify how often data should be sent default 1s",
+						default=1,
+						action="store")
+	#TODO doing fast and ugly way for now
 	args = parser.parse_args()
-
+	# (self,mqqthost,nodeid,service,base_topic)
 	# Init logging
 	logging.basicConfig(level=(logging.DEBUG if True or args.debug else logging.INFO))
+
+	ctime = args.ctime
+	nodeid = int(args.nodeid)
+	mqqt_host = args.mqtt
+	topic =args.topic
+	service = args.service
+
+
 
 	logger.info("%s v%s is starting up" % (__file__, softwareversion))
 	logLevel = {0: 'NOTSET', 10: 'DEBUG', 20: 'INFO', 30: 'WARNING', 40: 'ERROR'}
@@ -156,12 +207,15 @@ def main():
 	# Without this, the threads on wich the Pubnub.subscribe() functions only
 	# work when there is activity on the dbus.
 	# gobject.threads_init()
-	dbusmqtt = DbusMqtt()
+	dbusmqtt = DbusMqtt(mqqt_host,nodeid,service,topic)
 
+	while 1:
+		dbusmqtt.get_service_values()
+		sleep(ctime)
 	# Start and run the mainloop
 	logger.info("Starting mainloop, responding on only events")
-	mainloop = gobject.MainLoop()
-	mainloop.run()
+	#mainloop = gobject.MainLoop()
+	#mainloop.run()
 
 
 if __name__ == "__main__":
